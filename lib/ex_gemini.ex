@@ -4,10 +4,13 @@ defmodule ExGemini do
   """
 
   @default_opts [
-    model: "gemini-2.0-flash"
+    model: "gemini-2.0-flash",
+    api_version: "v1beta"
   ]
 
   @valid_roles [:user, :model]
+
+  @builtin_tools [:code_execution, :google_search]
 
   def new(opts \\ []) do
     opts = Keyword.merge(@default_opts, opts)
@@ -61,21 +64,38 @@ defmodule ExGemini do
     })
   end
 
+  def add_tool({%{tools: tools} = request, meta}, :gemini, tool_name)
+      when tool_name in @builtin_tools do
+    {Map.put(
+       request,
+       :tools,
+       tools ++
+         [
+           %{
+             Atom.to_string(tool_name) => %{}
+           }
+         ]
+     ), meta}
+  end
+
   def add_tool({%{tools: tools} = request, meta}, module, tool_name) do
     new_tools =
       tools
-      |> Enum.map(fn tool ->
-        case tool do
+      |> upsert(
+        fn
           %{functionDeclarations: function_declarations} ->
             %{
               functionDeclarations:
                 function_declarations ++ [apply(module, :registered_tools, [tool_name])]
             }
 
-          other ->
-            other
-        end
-      end)
+          _ ->
+            false
+        end,
+        %{
+          functionDeclarations: [apply(module, :registered_tools, [tool_name])]
+        }
+      )
 
     {_, new_meta} =
       Keyword.get_and_update(meta, :module_map, fn module_map ->
@@ -94,9 +114,9 @@ defmodule ExGemini do
   def add_tool({request, meta}, module, tool_name) do
     add_tool(
       {Map.put(request, :tools, [
-         %{
-           functionDeclarations: []
-         }
+         # %{
+         #   functionDeclarations: []
+         # }
        ]), meta},
       module,
       tool_name
@@ -105,10 +125,11 @@ defmodule ExGemini do
 
   def execute({request, meta}) do
     model = Keyword.fetch!(meta, :model)
+    api_version = Keyword.fetch!(meta, :api_version)
     api_key = Application.get_env(:ex_gemini, ExGemini)[:api_key]
 
     url =
-      "https://generativelanguage.googleapis.com/v1beta/models/#{model}:generateContent?key=#{api_key}"
+      "https://generativelanguage.googleapis.com/#{api_version}/models/#{model}:generateContent?key=#{api_key}"
 
     Req.post(url, json: request, headers: [{"Content-Type", "application/json"}])
     |> handle_response({request, meta})
@@ -159,6 +180,23 @@ defmodule ExGemini do
     else
       {false, res} -> {:ok, res, {response, meta} |> add_part(:model, part)}
       _ -> {:error, :bad_function_call}
+    end
+  end
+
+  defp upsert(list, match_and_transform_fn, default_item) do
+    {found, result} =
+      Enum.reduce(list, {false, []}, fn item, {found, acc} ->
+        case match_and_transform_fn.(item) do
+          nil -> {found, [item | acc]}
+          false -> {found, [item | acc]}
+          updated_item -> {true, [updated_item | acc]}
+        end
+      end)
+
+    if found do
+      Enum.reverse(result)
+    else
+      Enum.reverse([default_item | result])
     end
   end
 end
